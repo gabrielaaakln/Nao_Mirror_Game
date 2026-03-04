@@ -1,0 +1,15 @@
+# Ignore the pynaoqi library files
+code/docker-video/pynaoqi-python2.7-2.8.6.23-linux64-20191127_152327/
+code/docker-command/pynaoqi-python2.7-2.8.6.23-linux64-20191127_152327/
+
+#Ignore MacOS thingy
+.DS_Store
+
+#Vs code thingy
+.vscode/
+
+#ignore venv
+venv/
+
+#ignore the models
+Models/
