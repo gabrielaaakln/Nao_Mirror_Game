@@ -8,7 +8,8 @@ import signal
 app = Flask(__name__)
 
 #Configurare
-ROBOT_IP = "10.195.28.34"
+# ROBOT_IP = "10.195.28.34" //flowerpower
+ROBOT_IP = "172.20.10.2" #gabitzu
 ROBOT_PORT = 9559
 
 # Variabile globale
@@ -74,19 +75,39 @@ def update_movement():
         # The new client sends: {"type": "angles", "joints": {...}}
         if data.get("type") == "joints" and "joints" in data:
             joints = data["joints"]
-            # Print specific joint for debugging if it exists
-            if "LShoulderRoll" in joints:
-                # print(f"SET: RShoulderRoll = {joints['RShoulderRoll']}")
-                motion.setAngles("LShoulderRoll", joints["LShoulderRoll"], 0.2)
-            else:
-                print("RElbowRoll failed!!")
+            
+            # Cast unicode keys to standard strings
+            names = [str(k) for k in joints.keys()]
+            
+            # Ensure angles are floats
+            angles = [float(v) for v in joints.values()]
+
+            fractionMaxSpeed = 0.1
+
+            motion.setAngles(names, angles, fractionMaxSpeed)
+            # # Print specific joint for debugging if it exists
+            # if "LShoulderRoll" in joints:
+            #     # print(f"SET: RShoulderRoll = {joints['RShoulderRoll']}")
+            #     motion.setAngles("LShoulderRoll", joints["LShoulderRoll"], 0.2)
+            # else:
+            #     print("LShouolderRoll failed!!")
         
-            # Fallback for old position data or other types
-            if "LShoulderPitch" in joints:
-                # print(f"SET: RShoulderPitch = {joints['RShoulderPitch']}")
-                motion.setAngles("LShoulderPitch", joints["LShoulderPitch"], 0.2)
-            else:
-                print("LShoulderPitch failed!!")
+            # # Fallback for old position data or other types
+            # if "LShoulderPitch" in joints:
+            #     # print(f"SET: RShoulderPitch = {joints['RShoulderPitch']}")
+            #     motion.setAngles("LShoulderPitch", joints["LShoulderPitch"], 0.2)
+            # else:
+            #     print("LShoulderPitch failed!!")
+
+            # if "LElbowRoll" in joints:
+            #     motion.setAngles("LElbowRoll", joints["LElbowRoll"], 0.2)
+            # else:
+            #     print("LElbowRoll failed!!")
+
+            # if "LElbowYaw" in joints:
+            #     motion.setAngles("LElbowYaw", joints["LElbowYaw"], 0.2)
+            # else:
+            #     print("LElbowYaw failed!!")
         
     return jsonify({"status": "success"}), 200
 

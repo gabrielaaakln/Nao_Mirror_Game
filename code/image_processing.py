@@ -41,72 +41,127 @@ LAST_COMMAND_TIME = 0
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 pose = mp_pose.Pose(
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    min_detection_confidence=1.0,
+    min_tracking_confidence=1.0
 )
 
-    
+
+def rotation_matrix_y(angle):
+    """Rotație în jurul axei Y (Pitch)"""
+    c = np.cos(angle)
+    s = np.sin(angle)
+    return np.array([
+        [c,  0, s],
+        [0,  1, 0],
+        [-s, 0, c]
+    ])
+
+def rotation_matrix_z(angle):
+    """Rotație în jurul axei Z (Roll)"""
+    c = np.cos(angle)
+    s = np.sin(angle)
+    return np.array([
+        [c, -s, 0],
+        [s,  c, 0],
+        [0,  0, 1]
+    ])
+
+import numpy as np
+
 def right_hand_joints(detection_result):
     NAO_LIMITS = {
-    "LShoulderPitch": [-2.0857, 2.0857],
-    "LShoulderRoll":  [-0.3142, 1.3265],
-    "LElbowYaw":      [-2.0857, 2.0857],
-    "LElbowRoll":     [-1.5446, -0.0349]
-}
+        "LShoulderPitch": [-2.0857, 2.0857],
+        "LShoulderRoll":  [-0.3142, 1.3265],
+        "LElbowYaw":      [-2.0857, 2.0857],
+        "LElbowRoll":     [-1.5446, -0.0349]
+    }
 
     pose_landmarks_list = detection_result.pose_world_landmarks[0]
 
-    # mediapipe pose_landmarks
-    Rshoulder = pose_landmarks_list[12]
-    Lshoulder = pose_landmarks_list[11] 
-    Relbow    = pose_landmarks_list[14] 
-    Rhip      = pose_landmarks_list[24]  
+    # Extragem landmark-urile pentru brațul DREPT al omului
+    Rshoulder_Point = np.array([pose_landmarks_list[12].x, pose_landmarks_list[12].y, pose_landmarks_list[12].z])
+    Lshoulder_Point = np.array([pose_landmarks_list[11].x, pose_landmarks_list[11].y, pose_landmarks_list[11].z])
+    Relbow_Point    = np.array([pose_landmarks_list[14].x, pose_landmarks_list[14].y, pose_landmarks_list[14].z])
+    RWrist_Point    = np.array([pose_landmarks_list[16].x, pose_landmarks_list[16].y, pose_landmarks_list[16].z])
+    Rhip_Point      = np.array([pose_landmarks_list[24].x, pose_landmarks_list[24].y, pose_landmarks_list[24].z])
 
-    # Calcul puncte
-    Rshoulder_Point = np.array([Rshoulder.x, Rshoulder.y, Rshoulder.z])
-    Lshoulder_Point = np.array([Lshoulder.x, Lshoulder.y, Lshoulder.z])
-    Relbow_Point    = np.array([Relbow.x, Relbow.y, Relbow.z])
-    Rhip_Point      = np.array([Rhip.x, Rhip.y, Rhip.z])
-
-    # Calcul X, Y, Z - referinta
-    X = Lshoulder_Point - Rshoulder_Point
+    # Sistem de referință trunchi (Om)
+    X = Lshoulder_Point - Rshoulder_Point # Spre stânga omului
     X /= np.linalg.norm(X)
 
-    Y = Rhip_Point - Rshoulder_Point
+    Y = Rhip_Point - Rshoulder_Point      # În jos
     Y /= np.linalg.norm(Y)
 
-    Z = np.cross(Y, X)
+    Z = np.cross(Y, X)                    # Spre cameră / În față
     Z /= np.linalg.norm(Z)
 
-    # Vector brat
+    # Vectori braț și antebraț (Om)
     Varm = Relbow_Point - Rshoulder_Point
     Varm /= np.linalg.norm(Varm)
 
-    L_Shoulder_Pitch = np.atan2(np.dot(Varm, Y), np.dot(Varm, Z))
+    Vforearm = RWrist_Point - Relbow_Point
+    Vforearm /= np.linalg.norm(Vforearm)
 
-    Varm_in_plane = Varm - np.dot(Varm, X) * X 
-    Varm_in_plane /= np.linalg.norm(Varm_in_plane)
+    # 1. Calculăm Shoulder Pitch și Roll (Logica ta funcționează perfect pentru mirroring)
+    L_Shoulder_Pitch = np.arctan2(np.dot(Varm, Y), np.dot(Varm, Z))
+    L_Shoulder_Roll  = -np.arctan2(np.dot(Varm, X), np.sqrt(np.dot(Varm, Y)**2 + np.dot(Varm, Z)**2))
 
-    L_Shoulder_Roll = -np.atan2(np.dot(Varm, X), np.sqrt(np.dot(Varm, Y)**2 + np.dot(Varm, Z)**2))
+    # IMPORTANT: Facem clamp la umăr ÎNAINTE de a calcula cotul. 
+    # Dacă NAO nu poate atinge unghiul tău de umăr, referința pentru cot trebuie calculată
+    # de la poziția fizică în care se află brațul robotului, nu al tău.
+    L_Shoulder_Pitch = np.clip(L_Shoulder_Pitch, *NAO_LIMITS["LShoulderPitch"])
+    L_Shoulder_Roll  = np.clip(L_Shoulder_Roll,  *NAO_LIMITS["LShoulderRoll"])
 
-    #Clamping
-    L_Shoulder_Pitch = np.clip(L_Shoulder_Pitch, NAO_LIMITS["LShoulderPitch"][0], NAO_LIMITS["LShoulderPitch"][1])
-    L_Shoulder_Roll = np.clip(L_Shoulder_Roll, NAO_LIMITS["LShoulderRoll"][0], NAO_LIMITS["LShoulderRoll"][1])
+    # 2. Elbow Roll
+    L_Elbow_Roll = -np.arccos(np.clip(np.dot(Varm, Vforearm), -1.0, 1.0))
 
-    return L_Shoulder_Pitch, L_Shoulder_Roll  
+    # 3. Elbow Yaw - Mapare pe cinematica robotului NAO
+    # Mapăm direcțiile brațului omului direct pe sistemul de coordonate stâng de la NAO:
+    # X_nao (Față) = Z_om, Y_nao (Stânga) = -X_om, Z_nao (Sus) = -Y_om
+    Varm_nao = np.array([np.dot(Varm, Z), -np.dot(Varm, X), -np.dot(Varm, Y)])
+    Vforearm_nao = np.array([np.dot(Vforearm, Z), -np.dot(Vforearm, X), -np.dot(Vforearm, Y)])
 
+    # Normala planului format de braț și antebraț
+    n_arm = np.cross(Varm_nao, Vforearm_nao)
+    norm_n = np.linalg.norm(n_arm)
+
+    if norm_n > 1e-4: # Brațul nu este complet întins (gimbal lock natural)
+        n_arm /= norm_n
+
+        # Reconstruim orientarea umărului robotului folosind unghiurile calculate
+        cp, sp = np.cos(L_Shoulder_Pitch), np.sin(L_Shoulder_Pitch)
+        cr, sr = np.cos(L_Shoulder_Roll),  np.sin(L_Shoulder_Roll)
+
+        # Deduse din înmulțirea matricilor RotY(Pitch) * RotZ(Roll)
+        # Acestea sunt axele locale Y și Z ale brațului superior DUPĂ rotirea din umăr
+        Y_local = np.array([-cp*sr, cr, sp*sr]) 
+        Z_local = np.array([sp, 0, cp])         
+
+        # Calculăm Yaw proiectând normala brațului pe axele locale
+        L_Elbow_Yaw = np.arctan2(np.dot(n_arm, Y_local), -np.dot(n_arm, Z_local))
+    else:
+        # Dacă brațul e perfect întins, Yaw-ul este incalculabil geometric. Păstrăm 0.
+        L_Elbow_Yaw = 0.0
+
+    # 4. Clamp Final
+    L_Elbow_Roll     = np.clip(L_Elbow_Roll,     *NAO_LIMITS["LElbowRoll"])
+    L_Elbow_Yaw      = np.clip(L_Elbow_Yaw,      *NAO_LIMITS["LElbowYaw"])
+
+    return L_Shoulder_Pitch, L_Shoulder_Roll, L_Elbow_Roll, L_Elbow_Yaw
 
 
 def send_arm_angles(joints):
     """Trimite unghiurile către serverul Flask în thread separat."""
     def _send():
         try:
-            pitch, roll = joints
+            shoulder_pitch, shoulder_roll, elbow_roll, elbow_yaw = joints
             payload = {
                 "type": "joints",
                 "joints": {
-                    "LShoulderPitch": pitch,
-                    "LShoulderRoll": roll
+                    "LShoulderPitch": shoulder_pitch,
+                    "LShoulderRoll": shoulder_roll,
+                    "LElbowRoll": elbow_roll,
+                    "LElbowYaw": elbow_yaw
                     }
 
                 }
@@ -338,7 +393,7 @@ def receive_frame(conn):
 
 def main():
     # Schimbă între "laptop" și "NAO"
-    camera_capture("NAO")
+    camera_capture("laptop")
 
 if __name__ == '__main__':
     main()

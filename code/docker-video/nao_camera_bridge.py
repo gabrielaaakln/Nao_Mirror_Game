@@ -7,9 +7,11 @@ import numpy as np
 import sys
 import time
 
-NAO_IP = "10.195.28.34"         
+# NAO_IP = "10.195.28.34" //flowerpower
+NAO_IP = "172.20.10.2" #gabitzu    
 NAO_PORT = 9559
-MAC_RECEIVER_IP = "10.195.28.5"
+# MAC_RECEIVER_IP = "10.195.28.5" #flowerpower
+MAC_RECEIVER_IP = "172.28.224.1"    #gabitzu
 MAC_RECEIVER_PORT = 5001
 
 def connect_video():
