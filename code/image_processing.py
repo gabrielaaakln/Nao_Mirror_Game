@@ -45,35 +45,14 @@ pose = mp_pose.Pose(
     min_tracking_confidence=1.0
 )
 
-
-def rotation_matrix_y(angle):
-    """Rotație în jurul axei Y (Pitch)"""
-    c = np.cos(angle)
-    s = np.sin(angle)
-    return np.array([
-        [c,  0, s],
-        [0,  1, 0],
-        [-s, 0, c]
-    ])
-
-def rotation_matrix_z(angle):
-    """Rotație în jurul axei Z (Roll)"""
-    c = np.cos(angle)
-    s = np.sin(angle)
-    return np.array([
-        [c, -s, 0],
-        [s,  c, 0],
-        [0,  0, 1]
-    ])
-
-import numpy as np
-
-def right_hand_joints(detection_result):
+def right_hand_joints(detection_result, right_hand_landmarks):
     NAO_LIMITS = {
         "LShoulderPitch": [-2.0857, 2.0857],
         "LShoulderRoll":  [-0.3142, 1.3265],
         "LElbowYaw":      [-2.0857, 2.0857],
-        "LElbowRoll":     [-1.5446, -0.0349]
+        "LElbowRoll":     [-1.5446, -0.0349],
+        "LWristYaw":      [-1.8238, 1.8238],
+        "LHand":          [0.0, 1.0]
     }
 
     pose_landmarks_list = detection_result.pose_world_landmarks[0]
@@ -143,25 +122,61 @@ def right_hand_joints(detection_result):
         # Dacă brațul e perfect întins, Yaw-ul este incalculabil geometric. Păstrăm 0.
         L_Elbow_Yaw = 0.0
 
-    # 4. Clamp Final
+    # 3.5. WRIST YAW - Referință stabilă bazată pe trunchi
+
+    # landmark 5 = INDEX_MCP, landmark 17 = PINKY_MCP (baza degetelor, foarte stabile)
+    index_mcp = np.array([right_hand_landmarks[5].x, right_hand_landmarks[5].y])
+    pinky_mcp = np.array([right_hand_landmarks[17].x, right_hand_landmarks[17].y])
+
+    dx = index_mcp[0] - pinky_mcp[0]
+    dy = index_mcp[1] - pinky_mcp[1]
+
+    raw_wrist_angle = np.arctan2(dy, dx)
+    L_Wrist_Yaw = raw_wrist_angle + np.pi/2
+
+    # HAND OPEN/CLOSE
+    FINGERTIPS = [8, 12, 16, 20]
+    FINGER_MCP  = [5,  9, 13, 17]
+    wrist = np.array([right_hand_landmarks[0].x,
+                      right_hand_landmarks[0].y,
+                      right_hand_landmarks[0].z])
+    total_score = 0.0
+    for tip_idx, mcp_idx in zip(FINGERTIPS, FINGER_MCP):
+        tip = np.array([right_hand_landmarks[tip_idx].x,
+                        right_hand_landmarks[tip_idx].y,
+                        right_hand_landmarks[tip_idx].z])
+        mcp = np.array([right_hand_landmarks[mcp_idx].x,
+                        right_hand_landmarks[mcp_idx].y,
+                        right_hand_landmarks[mcp_idx].z])
+        dist_tip = np.linalg.norm(tip - wrist)
+        dist_mcp = np.linalg.norm(mcp - wrist)
+        total_score += dist_tip / (dist_mcp + 1e-6)
+
+    avg_score = total_score / len(FINGERTIPS)
+    L_Hand = float(np.clip((avg_score - 1.0) / 1.5, 0.0, 1.0))
+
+    # Limităm unghiurile
     L_Elbow_Roll     = np.clip(L_Elbow_Roll,     *NAO_LIMITS["LElbowRoll"])
     L_Elbow_Yaw      = np.clip(L_Elbow_Yaw,      *NAO_LIMITS["LElbowYaw"])
+    L_Wrist_Yaw      = np.clip(L_Wrist_Yaw,      *NAO_LIMITS["LWristYaw"])
 
-    return L_Shoulder_Pitch, L_Shoulder_Roll, L_Elbow_Roll, L_Elbow_Yaw
+    return L_Shoulder_Pitch, L_Shoulder_Roll, L_Elbow_Roll, L_Elbow_Yaw, L_Wrist_Yaw, L_Hand
 
 
 def send_arm_angles(joints):
     """Trimite unghiurile către serverul Flask în thread separat."""
     def _send():
         try:
-            shoulder_pitch, shoulder_roll, elbow_roll, elbow_yaw = joints
+            shoulder_pitch, shoulder_roll, elbow_roll, elbow_yaw, wrist_yaw, hand = joints
             payload = {
                 "type": "joints",
                 "joints": {
                     "LShoulderPitch": shoulder_pitch,
                     "LShoulderRoll": shoulder_roll,
                     "LElbowRoll": elbow_roll,
-                    "LElbowYaw": elbow_yaw
+                    "LElbowYaw": elbow_yaw,
+                    "LWristYaw": wrist_yaw,
+                    "LHand": hand
                     }
 
                 }
@@ -314,25 +329,25 @@ def camera_capture(camera_input):
             annotated_image_bgr = cv2.cvtColor(annotated_image_rgb, cv2.COLOR_RGB2BGR)
 
             # === MIRROR GAME LOGIC ===
+            # === MIRROR GAME LOGIC ===
             if pose_landmarker_result.pose_landmarks:
                 try:
-                    # Calculează joints in radiani
-                    joints = right_hand_joints(pose_landmarker_result)
-                    
-                    # Afișează pe ecran
-                    # y = 30
-                    # for nume, val in joints.items():
-                    #     text = f"{nume}: {math.degrees(val):.1f}°"
-                    #     cv2.putText(annotated_image_bgr, text, (10, y),
-                    #                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    #     y += 25
-                    
-                    # Trimite la NAO (cu rate limiting)
-                    timp_acum = time.time()
-                    if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
-                        send_arm_angles(joints)
-                        LAST_COMMAND_TIME = timp_acum
-                        
+                    # Găsește mâna dreaptă din hand results
+                    right_hand_landmarks = None
+                    for i, handedness in enumerate(hand_landmarker_result.handedness):
+                        if handedness[0].category_name == "Right":
+                            right_hand_landmarks = hand_landmarker_result.hand_landmarks[i]
+                            break
+
+                    # Calculează joints doar dacă avem și mâna detectată
+                    if right_hand_landmarks is not None:
+                        joints = right_hand_joints(pose_landmarker_result, right_hand_landmarks)
+            
+                        timp_acum = time.time()
+                        if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
+                            send_arm_angles(joints)
+                            LAST_COMMAND_TIME = timp_acum
+        
                 except Exception as e:
                     print(f"Eroare calcul unghiuri: {e}\n\n")
 
