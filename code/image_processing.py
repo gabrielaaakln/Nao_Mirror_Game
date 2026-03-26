@@ -12,13 +12,17 @@ import time
 import requests
 import threading
 import math
-
+import json
 import os
+import jointsCalculator
 
 # Get the absolute path and normalize it
-BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
-HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
-POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
+# BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
+# HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+# POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
+
+HAND_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/hand_landmarker.task'
+POSE_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/pose_landmarker_heavy.task'
 
 print(f"paths: {HAND_MODEL_PATH}\n {POSE_MODEL_PATH}")
 
@@ -34,8 +38,12 @@ PORT = 5001
 
 NAO_BRIDGE_URL = "http://127.0.0.1:5050/movement"
 
-COMMAND_INTERVAL = 0.7  # 10 comenzi pe secundă max
+COMMAND_INTERVAL = 0.1  # comenzi la 20fps
 LAST_COMMAND_TIME = 0
+
+NAO_CMD_IP = "127.0.0.1" # Ensure this points to your command bridge Docker IP
+NAO_CMD_PORT = 5050
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Inițializare MediaPipe Pose (SIMPLU)
 mp_pose = mp.solutions.pose
@@ -45,146 +53,25 @@ pose = mp_pose.Pose(
     min_tracking_confidence=1.0
 )
 
-def right_hand_joints(detection_result, right_hand_landmarks):
-    NAO_LIMITS = {
-        "LShoulderPitch": [-2.0857, 2.0857],
-        "LShoulderRoll":  [-0.3142, 1.3265],
-        "LElbowYaw":      [-2.0857, 2.0857],
-        "LElbowRoll":     [-1.5446, -0.0349],
-        "LWristYaw":      [-1.8238, 1.8238],
-        "LHand":          [0.0, 1.0]
-    }
-
-    pose_landmarks_list = detection_result.pose_world_landmarks[0]
-
-    # Extragem landmark-urile pentru brațul DREPT al omului
-    Rshoulder_Point = np.array([pose_landmarks_list[12].x, pose_landmarks_list[12].y, pose_landmarks_list[12].z])
-    Lshoulder_Point = np.array([pose_landmarks_list[11].x, pose_landmarks_list[11].y, pose_landmarks_list[11].z])
-    Relbow_Point    = np.array([pose_landmarks_list[14].x, pose_landmarks_list[14].y, pose_landmarks_list[14].z])
-    RWrist_Point    = np.array([pose_landmarks_list[16].x, pose_landmarks_list[16].y, pose_landmarks_list[16].z])
-    Rhip_Point      = np.array([pose_landmarks_list[24].x, pose_landmarks_list[24].y, pose_landmarks_list[24].z])
-
-    # Sistem de referință trunchi (Om)
-    X = Lshoulder_Point - Rshoulder_Point # Spre stânga omului
-    X /= np.linalg.norm(X)
-
-    Y = Rhip_Point - Rshoulder_Point      # În jos
-    Y /= np.linalg.norm(Y)
-
-    Z = np.cross(Y, X)                    # Spre cameră / În față
-    Z /= np.linalg.norm(Z)
-
-    # Vectori braț și antebraț (Om)
-    Varm = Relbow_Point - Rshoulder_Point
-    Varm /= np.linalg.norm(Varm)
-
-    Vforearm = RWrist_Point - Relbow_Point
-    Vforearm /= np.linalg.norm(Vforearm)
-
-    # 1. Calculăm Shoulder Pitch și Roll (Logica ta funcționează perfect pentru mirroring)
-    L_Shoulder_Pitch = np.arctan2(np.dot(Varm, Y), np.dot(Varm, Z))
-    L_Shoulder_Roll  = -np.arctan2(np.dot(Varm, X), np.sqrt(np.dot(Varm, Y)**2 + np.dot(Varm, Z)**2))
-
-    # IMPORTANT: Facem clamp la umăr ÎNAINTE de a calcula cotul. 
-    # Dacă NAO nu poate atinge unghiul tău de umăr, referința pentru cot trebuie calculată
-    # de la poziția fizică în care se află brațul robotului, nu al tău.
-    L_Shoulder_Pitch = np.clip(L_Shoulder_Pitch, *NAO_LIMITS["LShoulderPitch"])
-    L_Shoulder_Roll  = np.clip(L_Shoulder_Roll,  *NAO_LIMITS["LShoulderRoll"])
-
-    # 2. Elbow Roll
-    L_Elbow_Roll = -np.arccos(np.clip(np.dot(Varm, Vforearm), -1.0, 1.0))
-
-    # 3. Elbow Yaw - Mapare pe cinematica robotului NAO
-    # Mapăm direcțiile brațului omului direct pe sistemul de coordonate stâng de la NAO:
-    # X_nao (Față) = Z_om, Y_nao (Stânga) = -X_om, Z_nao (Sus) = -Y_om
-    Varm_nao = np.array([np.dot(Varm, Z), -np.dot(Varm, X), -np.dot(Varm, Y)])
-    Vforearm_nao = np.array([np.dot(Vforearm, Z), -np.dot(Vforearm, X), -np.dot(Vforearm, Y)])
-
-    # Normala planului format de braț și antebraț
-    n_arm = np.cross(Varm_nao, Vforearm_nao)
-    norm_n = np.linalg.norm(n_arm)
-
-    if norm_n > 1e-4: # Brațul nu este complet întins (gimbal lock natural)
-        n_arm /= norm_n
-
-        # Reconstruim orientarea umărului robotului folosind unghiurile calculate
-        cp, sp = np.cos(L_Shoulder_Pitch), np.sin(L_Shoulder_Pitch)
-        cr, sr = np.cos(L_Shoulder_Roll),  np.sin(L_Shoulder_Roll)
-
-        # Deduse din înmulțirea matricilor RotY(Pitch) * RotZ(Roll)
-        # Acestea sunt axele locale Y și Z ale brațului superior DUPĂ rotirea din umăr
-        Y_local = np.array([-cp*sr, cr, sp*sr]) 
-        Z_local = np.array([sp, 0, cp])         
-
-        # Calculăm Yaw proiectând normala brațului pe axele locale
-        L_Elbow_Yaw = np.arctan2(np.dot(n_arm, Y_local), -np.dot(n_arm, Z_local))
-    else:
-        # Dacă brațul e perfect întins, Yaw-ul este incalculabil geometric. Păstrăm 0.
-        L_Elbow_Yaw = 0.0
-
-    # 3.5. WRIST YAW - Referință stabilă bazată pe trunchi
-
-    # landmark 5 = INDEX_MCP, landmark 17 = PINKY_MCP (baza degetelor, foarte stabile)
-    index_mcp = np.array([right_hand_landmarks[5].x, right_hand_landmarks[5].y])
-    pinky_mcp = np.array([right_hand_landmarks[17].x, right_hand_landmarks[17].y])
-
-    dx = index_mcp[0] - pinky_mcp[0]
-    dy = index_mcp[1] - pinky_mcp[1]
-
-    raw_wrist_angle = np.arctan2(dy, dx)
-    L_Wrist_Yaw = raw_wrist_angle + np.pi/2
-
-    # HAND OPEN/CLOSE
-    FINGERTIPS = [8, 12, 16, 20]
-    FINGER_MCP  = [5,  9, 13, 17]
-    wrist = np.array([right_hand_landmarks[0].x,
-                      right_hand_landmarks[0].y,
-                      right_hand_landmarks[0].z])
-    total_score = 0.0
-    for tip_idx, mcp_idx in zip(FINGERTIPS, FINGER_MCP):
-        tip = np.array([right_hand_landmarks[tip_idx].x,
-                        right_hand_landmarks[tip_idx].y,
-                        right_hand_landmarks[tip_idx].z])
-        mcp = np.array([right_hand_landmarks[mcp_idx].x,
-                        right_hand_landmarks[mcp_idx].y,
-                        right_hand_landmarks[mcp_idx].z])
-        dist_tip = np.linalg.norm(tip - wrist)
-        dist_mcp = np.linalg.norm(mcp - wrist)
-        total_score += dist_tip / (dist_mcp + 1e-6)
-
-    avg_score = total_score / len(FINGERTIPS)
-    L_Hand = float(np.clip((avg_score - 1.0) / 1.5, 0.0, 1.0))
-
-    # Limităm unghiurile
-    L_Elbow_Roll     = np.clip(L_Elbow_Roll,     *NAO_LIMITS["LElbowRoll"])
-    L_Elbow_Yaw      = np.clip(L_Elbow_Yaw,      *NAO_LIMITS["LElbowYaw"])
-    L_Wrist_Yaw      = np.clip(L_Wrist_Yaw,      *NAO_LIMITS["LWristYaw"])
-
-    return L_Shoulder_Pitch, L_Shoulder_Roll, L_Elbow_Roll, L_Elbow_Yaw, L_Wrist_Yaw, L_Hand
-
-
 def send_arm_angles(joints):
-    """Trimite unghiurile către serverul Flask în thread separat."""
-    def _send():
-        try:
-            shoulder_pitch, shoulder_roll, elbow_roll, elbow_yaw, wrist_yaw, hand = joints
-            payload = {
-                "type": "joints",
-                "joints": {
-                    "LShoulderPitch": shoulder_pitch,
-                    "LShoulderRoll": shoulder_roll,
-                    "LElbowRoll": elbow_roll,
-                    "LElbowYaw": elbow_yaw,
-                    "LWristYaw": wrist_yaw,
-                    "LHand": hand
-                    }
-
-                }
-            requests.post(NAO_BRIDGE_URL, json=payload, timeout=1.00)
-            print(f"SENT: {payload}")
-        except Exception as e:
-            print(f"EXCEPTIE: {e}")
-    threading.Thread(target=_send, daemon=True).start()
+    """Fires a UDP packet to the command bridge instantly."""
+    try:
+        shoulderPitch, shoulderRoll, elbowRoll, elbowYaw, wrist_yaw, hand = joints
+        payload = {
+            "type": "joints",
+            "joints": {
+                "LShoulderPitch": float(shoulderPitch),
+                "LShoulderRoll": float(shoulderRoll),
+                "LElbowRoll": float(elbowRoll),
+                "LElbowYaw": float(elbowYaw),
+                "LWristYaw": float(wrist_yaw),
+                "LHand": float(hand)
+            }
+        }
+        # Fire and forget. No waiting for a response.
+        udp_sock.sendto(json.dumps(payload).encode('utf-8'), (NAO_CMD_IP, NAO_CMD_PORT))
+    except Exception as e:
+        print(f"UDP Error: {e}")
 
 def draw_pose_landmarks_on_image(rgb_image, detection_result):
     """Desenează landmark-urile pose pe imagine."""
@@ -253,6 +140,8 @@ def camera_capture(camera_input):
         srv = setup_server(HOST, PORT)
         print("Waiting for NAO to connect...")
         conn, addr = srv.accept()
+        # Ensure the accepted connection also disables buffering
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
         print(f"Connected by {addr}")
     
     try:
@@ -329,10 +218,9 @@ def camera_capture(camera_input):
             annotated_image_bgr = cv2.cvtColor(annotated_image_rgb, cv2.COLOR_RGB2BGR)
 
             # === MIRROR GAME LOGIC ===
-            # === MIRROR GAME LOGIC ===
             if pose_landmarker_result.pose_landmarks:
                 try:
-                    # Găsește mâna dreaptă din hand results
+                     # Găsește mâna dreaptă din hand results
                     right_hand_landmarks = None
                     for i, handedness in enumerate(hand_landmarker_result.handedness):
                         if handedness[0].category_name == "Right":
@@ -341,13 +229,13 @@ def camera_capture(camera_input):
 
                     # Calculează joints doar dacă avem și mâna detectată
                     if right_hand_landmarks is not None:
-                        joints = right_hand_joints(pose_landmarker_result, right_hand_landmarks)
+                        joints = jointsCalculator.right_hand_joints(pose_landmarker_result, right_hand_landmarks)
             
                         timp_acum = time.time()
                         if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
                             send_arm_angles(joints)
                             LAST_COMMAND_TIME = timp_acum
-        
+                        
                 except Exception as e:
                     print(f"Eroare calcul unghiuri: {e}\n\n")
 
@@ -374,9 +262,12 @@ def camera_capture(camera_input):
         cv2.destroyAllWindows()
 
 def setup_server(host, port):
-    """Creează server socket pentru primire frame-uri de la NAO."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # --- PRIORITY 4: Disable Nagle's Algorithm to send frames immediately ---
+    srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
+    
     srv.bind((host, port))
     srv.listen(1)
     print(f"Server listening on {host}:{port}")
@@ -408,7 +299,7 @@ def receive_frame(conn):
 
 def main():
     # Schimbă între "laptop" și "NAO"
-    camera_capture("laptop")
+    camera_capture("NAO")
 
 if __name__ == '__main__':
     main()

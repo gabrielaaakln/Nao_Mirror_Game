@@ -7,18 +7,16 @@ import numpy as np
 import sys
 import time
 
-# NAO_IP = "10.195.28.34" //flowerpower
-NAO_IP = "172.20.10.2" #gabitzu    
+NAO_IP = "172.20.10.4"         
 NAO_PORT = 9559
-# MAC_RECEIVER_IP = "10.195.28.5" #flowerpower
-MAC_RECEIVER_IP = "172.28.224.1"    #gabitzu
+MAC_RECEIVER_IP = "172.20.10.5"
 MAC_RECEIVER_PORT = 5001
 
 def connect_video():
     video = ALProxy("ALVideoDevice", NAO_IP, NAO_PORT)
     # subscribeCamera(clientName, cameraIndex, resolution, colorSpace, fps)
     # cameraIndex: 0=top, 1=bottom; resolution: 0=QQVGA, 1=QVGA; colorSpace: 11=RGB, fps=30
-    sub = video.subscribeCamera("nao_bridge", 0, 1, 11, 30)
+    sub = video.subscribeCamera("nao_bridge", 0, 1, 13, 30)
     return video, sub
 
 def get_image_array(nao_img):
@@ -45,10 +43,14 @@ def main():
     print("Connecting to NAO at", NAO_IP)
     video, sub = connect_video()
 
-    # connect to Mac receiver
-    print("Connecting to receiver at {MAC_RECEIVER_IP}:{MAC_RECEIVER_PORT}")
+    print("Connecting to receiver at {}:{}".format(MAC_RECEIVER_IP, MAC_RECEIVER_PORT))
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # attempt multiple times if network not ready
+    
+    # --- PRIORITY 4: Disable Nagle's Algorithm ---
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    # [Keep your connection retry loop]
+    # Attempt multiple times if network not ready
     for i in range(10):
         try:
             sock.connect((MAC_RECEIVER_IP, MAC_RECEIVER_PORT))
@@ -69,12 +71,8 @@ def main():
             if arr is None:
                 continue
 
-            #Convert the image from NAO's RGB format to OpenCV's BGR format
-            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            
-            # encode as JPEG
-            ret, jpg = cv2.imencode(".jpg", arr_bgr)
-
+            # --- PRIORITY 5: Removed cv2.cvtColor! We encode 'arr' directly since it's already BGR ---
+            ret, jpg = cv2.imencode(".jpg", arr)
 
             if not ret:
                 continue
