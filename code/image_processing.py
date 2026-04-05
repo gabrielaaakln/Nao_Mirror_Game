@@ -53,19 +53,29 @@ pose = mp_pose.Pose(
     min_tracking_confidence=1.0
 )
 
-def send_arm_angles(joints):
+def send_arm_angles(LHandjoints, RHandJoints, HJoints):
     """Fires a UDP packet to the command bridge instantly."""
     try:
-        shoulderPitch, shoulderRoll, elbowRoll, elbowYaw, wrist_yaw, hand = joints
+        LshoulderPitch, LshoulderRoll, LelbowRoll, LelbowYaw, Lwrist_yaw, Lhand = LHandjoints
+        RshoulderPitch, RshoulderRoll, RelbowRoll, RelbowYaw, Rwrist_yaw, Rhand = RHandJoints
+        head_yaw, head_pitch = HJoints
         payload = {
             "type": "joints",
             "joints": {
-                "LShoulderPitch": float(shoulderPitch),
-                "LShoulderRoll": float(shoulderRoll),
-                "LElbowRoll": float(elbowRoll),
-                "LElbowYaw": float(elbowYaw),
-                "LWristYaw": float(wrist_yaw),
-                "LHand": float(hand)
+                "LShoulderPitch": float(LshoulderPitch),
+                "LShoulderRoll": float(LshoulderRoll),
+                "LElbowRoll": float(LelbowRoll),
+                "LElbowYaw": float(LelbowYaw),
+                "LWristYaw": float(Lwrist_yaw),
+                "LHand": float(Lhand),
+                "RShoulderPitch": float(RshoulderPitch),
+                "RShoulderRoll": float(RshoulderRoll),
+                "RElbowRoll": float(RelbowRoll),
+                "RElbowYaw": float(RelbowYaw),
+                "RWristYaw": float(Rwrist_yaw),
+                "RHand": float(Rhand),
+                "HeadYaw": float(head_yaw),
+                "HeadPitch": float(head_pitch),
             }
         }
         # Fire and forget. No waiting for a response.
@@ -220,20 +230,28 @@ def camera_capture(camera_input):
             # === MIRROR GAME LOGIC ===
             if pose_landmarker_result.pose_landmarks:
                 try:
-                     # Găsește mâna dreaptă din hand results
+                    # Găsește mâna dreaptă din hand results
                     right_hand_landmarks = None
                     for i, handedness in enumerate(hand_landmarker_result.handedness):
                         if handedness[0].category_name == "Right":
                             right_hand_landmarks = hand_landmarker_result.hand_landmarks[i]
                             break
 
+                    # Găsește mâna stanga din hand results
+                    left_hand_landmarks = None
+                    for i, handedness in enumerate(hand_landmarker_result.handedness):
+                        if handedness[0].category_name == "Left":
+                            left_hand_landmarks = hand_landmarker_result.hand_landmarks[i]
+                            break
+
                     # Calculează joints doar dacă avem și mâna detectată
                     if right_hand_landmarks is not None:
-                        joints = jointsCalculator.right_hand_joints(pose_landmarker_result, right_hand_landmarks)
-            
+                        right_hand_joints = jointsCalculator.right_hand_joints(pose_landmarker_result, right_hand_landmarks)
+                        left_hand_joints = jointsCalculator.left_hand_joints(pose_landmarker_result, left_hand_landmarks)
+                        head_joints = jointsCalculator.calculate_head_tracking(pose_landmarker_result.pose_landmarks[0])
                         timp_acum = time.time()
                         if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
-                            send_arm_angles(joints)
+                            send_arm_angles(left_hand_joints, right_hand_joints, head_joints)
                             LAST_COMMAND_TIME = timp_acum
                         
                 except Exception as e:

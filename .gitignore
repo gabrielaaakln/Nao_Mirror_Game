@@ -13,3 +13,6 @@ venv/
 
 #ignore the models
 Models/
+
+#pychache
+code/__pycache__/

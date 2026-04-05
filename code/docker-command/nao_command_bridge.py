@@ -26,7 +26,11 @@ TARGET_JOINTS = ["LShoulderPitch",
                  "LElbowRoll",
                  "LElbowYaw",
                  "LWristYaw",
-                 "LHand"]
+                 "LHand",
+                 "HeadYaw",
+                 "HeadPitch"]
+
+WORDS_FOR_RECOGNISION = ["START", "STOP"]
 
 # Global variables
 motion = None
@@ -44,37 +48,57 @@ led_lock = threading.Lock()
 # Game State Flag (Start as False so it waits for "START")
 game_active = False
 
-# Blinking script
-current_eye_color = "blue"
+EYELASHES = [
+        "FaceLedRight7", "FaceLedLeft7",
+        "FaceLedLeft6", "FaceLedRight6"
+    ]
 
+def restore_eyelashes():
+    for led in EYELASHES:
+        leds.fadeRGB(led, 0xe68bbe, 0.0)
+
+current_eye_color = "white"
 def blink_loop():
-    """Background thread to make NAO blink naturally."""
     global leds, current_eye_color
-    
+
+    top_leds = [
+        "FaceLedLeft0", "FaceLedLeft1", "FaceLedLeft2",
+        "FaceLedRight0", "FaceLedRight1", "FaceLedRight2"
+    ]
+
+    bottom_leds = [
+        "FaceLedLeft5", "FaceLedLeft4", "FaceLedLeft3",
+        "FaceLedRight5", "FaceLedRight4", "FaceLedRight3"
+    ]
+
     while True:
-        # Wait a random amount of time between blinks (3 to 6 seconds)
         time.sleep(random.uniform(3.0, 6.0))
-        
+
         if leds:
             try:
-                # Save the current color so we know what to return to
                 color_to_restore = current_eye_color
-                
-                # SAFELY lock the proxy and blink
+
                 with led_lock:
-                    leds.fadeRGB("FaceLeds", "black", 0.1)
-                    time.sleep(0.1)
-                    leds.fadeRGB("FaceLeds", color_to_restore, 0.1)
+                    for led in bottom_leds + top_leds:
+                        leds.post.fadeRGB(led, 0x000000, 0.02)
+
+                    for led in bottom_leds+top_leds:
+                        leds.post.fadeRGB(led, color_to_restore, 0.08)
+                    
+                    restore_eyelashes()
+                    time.sleep(0.2)
+
             except Exception as e:
-                pass # Fail silently so a tiny blink error doesn't spam the console
+                print("BLINK ERROR: {}".format(e))
 
 
 # --- VOICE MONITORING THREAD ---
 def voice_monitor_loop():
-    """Background thread that constantly checks if NAO heard a command."""
     global game_active, current_eye_color
     
-    print("Voice monitor started. Listening for 'start' or 'stop'...")
+    last_word_seen = ""  # track the last word we already acted on
+
+    print("Voice monitor started. Listening for 'begin' or 'finish'...")
     
     while True:
         try:
@@ -84,26 +108,40 @@ def voice_monitor_loop():
                 word = data[0]
                 confidence = data[1]
                 
-                if confidence > 0.4:
-                    if word == "start" and not game_active:
-                        print("\n>>> VOICE COMMAND: 'START'. GAME ON! Eyes turning GREEN.")
+                # Only act if this is a NEW word we haven't handled yet
+                if confidence > 0.35 and word != last_word_seen:
+                    last_word_seen = word  # mark it as handled
+                    
+                    if word == WORDS_FOR_RECOGNISION[0] and not game_active:
+                        if motion:
+                            motion.setBreathEnabled("Body", False)
                         current_eye_color = "green"
                         with led_lock:
                             leds.fadeRGB("FaceLeds", "green", 0.2)
+                        time.sleep(1)
                         game_active = True
-                        
-                    elif word == "stop" and game_active:
-                        print("\n>>> VOICE COMMAND: 'STOP'. GAME PAUSED. Eyes turning BLUE again.")
-                        current_eye_color = "blue"
+                        current_eye_color = "white"
                         with led_lock:
-                            leds.fadeRGB("FaceLeds", "blue", 0.5)
-                        game_active = False
+                            leds.fadeRGB("FaceLeds", "white", 0.5)
+                            restore_eyelashes()
+
+                    elif word == WORDS_FOR_RECOGNISION[1] and game_active:
                         motion.post.setAngles(TARGET_JOINTS, L_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                        idle_robot()
+                        current_eye_color = "red"
+                        with led_lock:
+                            leds.fadeRGB("FaceLeds", "red", 0.2)
+                        time.sleep(1)
+                        game_active = False
+                        current_eye_color = "white"
+                        with led_lock:
+                            leds.fadeRGB("FaceLeds", "white", 0.5)
+                            restore_eyelashes()
 
         except Exception as e:
-            pass 
+            pass
             
-        time.sleep(0.5) 
+        time.sleep(0.5)
 
 
 # --- LIFECYCLE FUNCTIONS ---
@@ -120,19 +158,14 @@ def initialize_robot():
         speech = ALProxy("ALSpeechRecognition", ROBOT_IP, ROBOT_PORT)
         memory = ALProxy("ALMemory", ROBOT_IP, ROBOT_PORT)
 
-        if life.getState() != "disabled":
-            print("Disabling Autonomous Life...")
-            life.setState("disabled")
+        print("Setting Autonomous Life to disabled...")
+        life.setState("disabled")
 
         print("Waking up robot...")
         motion.wakeUp()
-        motion.setStiffnesses("RArm", 1.0)
-        motion.setAngles("HeadPitch", 0.1, 0.2)
 
-        # --- INITIALIZE GAME STATE ---
-        print("Setting initial state (Blue Eyes)...")
-        with led_lock:
-            leds.fadeRGB("FaceLeds", "blue", 0.5)
+        # leds.setIntensity("FaceLeds", 1.0)
+        idle_robot()
         
         # --- SETUP SPEECH RECOGNITION ---
         print("Setting up Speech Recognition...")
@@ -143,7 +176,7 @@ def initialize_robot():
         
         speech.pause(True)
         speech.setLanguage("English")
-        speech.setVocabulary(["start", "stop"], False)
+        speech.setWordListAsVocabulary(WORDS_FOR_RECOGNISION)
         speech.pause(False)
         speech.subscribe("MirrorGameVoice")
         
@@ -160,6 +193,19 @@ def initialize_robot():
     except Exception as e:
         print("CRITICAL ERROR: Could not connect to NAO.", e)
         sys.exit(1)
+
+
+def idle_robot():
+    global motion, leds
+
+    if leds:
+            try:
+                with led_lock:
+                    for led in EYELASHES:
+                        leds.fadeRGB(led, 0xe68bbe, 0.0)
+            except:
+                print("The eyelashes couldnt work!")
+    motion.setBreathEnabled("Body", True)
 
 
 def shutdown_robot(signum=None, frame=None):
