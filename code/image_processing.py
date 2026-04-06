@@ -17,12 +17,12 @@ import os
 import jointsCalculator
 
 # Get the absolute path and normalize it
-# BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
-# HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
-# POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
+BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
+HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
 
-HAND_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/hand_landmarker.task'
-POSE_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/pose_landmarker_heavy.task'
+# HAND_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/hand_landmarker.task'
+# POSE_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/pose_landmarker_heavy.task'
 
 print(f"paths: {HAND_MODEL_PATH}\n {POSE_MODEL_PATH}")
 
@@ -42,7 +42,7 @@ COMMAND_INTERVAL = 0.1  # comenzi la 20fps
 LAST_COMMAND_TIME = 0
 
 NAO_CMD_IP = "127.0.0.1" # Ensure this points to your command bridge Docker IP
-NAO_CMD_PORT = 5050
+NAO_CMD_PORT = 9876
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Inițializare MediaPipe Pose (SIMPLU)
@@ -53,29 +53,42 @@ pose = mp_pose.Pose(
     min_tracking_confidence=1.0
 )
 
-def send_arm_angles(LHandjoints, RHandJoints, HJoints):
+def send_Larm_angles(LHandjoints):
     """Fires a UDP packet to the command bridge instantly."""
     try:
         LshoulderPitch, LshoulderRoll, LelbowRoll, LelbowYaw, Lwrist_yaw, Lhand = LHandjoints
-        RshoulderPitch, RshoulderRoll, RelbowRoll, RelbowYaw, Rwrist_yaw, Rhand = RHandJoints
-        head_yaw, head_pitch = HJoints
         payload = {
             "type": "joints",
-            "joints": {
+            "LArmJoints": {
                 "LShoulderPitch": float(LshoulderPitch),
                 "LShoulderRoll": float(LshoulderRoll),
                 "LElbowRoll": float(LelbowRoll),
                 "LElbowYaw": float(LelbowYaw),
                 "LWristYaw": float(Lwrist_yaw),
-                "LHand": float(Lhand),
+                "LHand": float(Lhand)
+            }
+        }
+        # Fire and forget. No waiting for a response.
+        udp_sock.sendto(json.dumps(payload).encode('utf-8'), (NAO_CMD_IP, NAO_CMD_PORT))
+    except Exception as e:
+        print(f"UDP Error: {e}")
+
+
+
+def send_Rarm_angles(RHandjoints):
+    """Fires a UDP packet to the command bridge instantly."""
+    try:
+        RshoulderPitch, RshoulderRoll, RelbowRoll, RelbowYaw, Rwrist_yaw, Rhand = RHandjoints
+
+        payload = {
+            "type": "joints",
+            "RArmJoints": {
                 "RShoulderPitch": float(RshoulderPitch),
                 "RShoulderRoll": float(RshoulderRoll),
                 "RElbowRoll": float(RelbowRoll),
                 "RElbowYaw": float(RelbowYaw),
                 "RWristYaw": float(Rwrist_yaw),
-                "RHand": float(Rhand),
-                "HeadYaw": float(head_yaw),
-                "HeadPitch": float(head_pitch),
+                "RHand": float(Rhand)
             }
         }
         # Fire and forget. No waiting for a response.
@@ -232,27 +245,36 @@ def camera_capture(camera_input):
                 try:
                     # Găsește mâna dreaptă din hand results
                     right_hand_landmarks = None
-                    for i, handedness in enumerate(hand_landmarker_result.handedness):
-                        if handedness[0].category_name == "Right":
-                            right_hand_landmarks = hand_landmarker_result.hand_landmarks[i]
-                            break
-
-                    # Găsește mâna stanga din hand results
+                    right_hand_joints = None
                     left_hand_landmarks = None
+                    left_hand_joints = None
+
                     for i, handedness in enumerate(hand_landmarker_result.handedness):
-                        if handedness[0].category_name == "Left":
-                            left_hand_landmarks = hand_landmarker_result.hand_landmarks[i]
-                            break
+                        label = handedness[0].category_name
+                        landmarks = hand_landmarker_result.hand_landmarks[i]
+                        
+                        if label == "Left": #mediapipe's left is the persons right
+                            right_hand_landmarks = landmarks
+                        elif label == "Right":   #mediapipe's right is the persons left
+                            left_hand_landmarks = landmarks
 
                     # Calculează joints doar dacă avem și mâna detectată
                     if right_hand_landmarks is not None:
-                        right_hand_joints = jointsCalculator.right_hand_joints(pose_landmarker_result, right_hand_landmarks)
-                        left_hand_joints = jointsCalculator.left_hand_joints(pose_landmarker_result, left_hand_landmarks)
-                        head_joints = jointsCalculator.calculate_head_tracking(pose_landmarker_result.pose_landmarks[0])
-                        timp_acum = time.time()
-                        if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
-                            send_arm_angles(left_hand_joints, right_hand_joints, head_joints)
-                            LAST_COMMAND_TIME = timp_acum
+                        right_hand_joints = jointsCalculator.left_hand_joints(pose_landmarker_result, right_hand_landmarks)
+
+                    if left_hand_landmarks is not None:
+                        left_hand_joints = jointsCalculator.right_hand_joints(pose_landmarker_result, left_hand_landmarks)
+                    
+                    #head_joints = jointsCalculator.calculate_head_tracking(pose_landmarker_result.pose_landmarks[0]
+                    timp_acum = time.time()
+                    if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
+                        if left_hand_joints:
+                            send_Larm_angles(left_hand_joints)
+
+                        if right_hand_joints:
+                            send_Rarm_angles(right_hand_joints)
+                        
+                        LAST_COMMAND_TIME = timp_acum
                         
                 except Exception as e:
                     print(f"Eroare calcul unghiuri: {e}\n\n")
@@ -317,7 +339,7 @@ def receive_frame(conn):
 
 def main():
     # Schimbă între "laptop" și "NAO"
-    camera_capture("NAO")
+    camera_capture("laptop")
 
 if __name__ == '__main__':
     main()
