@@ -17,18 +17,29 @@ UDP_PORT = 5050
 #for reinitialising the robot
 R_HAND_DEFAULT_ANGLES = [1.44, -0.22, 1.19, 0.40, 0.1, 0.30]
 L_HAND_DEFAULT_ANGLES = [1.47, 0.19, -0.40, -1.18, 0.09, 0.30]
+HEAD_DEFAULT_ANGLES = [0.0, -0.16]
 
 #the speed at which the robot moves
 FRACTION_MAX_SPEED = 0.15 
 
-TARGET_JOINTS = ["LShoulderPitch",
+LEFT_ARM_TARGET_JOINTS = ["LShoulderPitch",
                  "LShoulderRoll",
                  "LElbowRoll",
                  "LElbowYaw",
                  "LWristYaw",
-                 "LHand",
-                 "HeadYaw",
-                 "HeadPitch"]
+                 "LHand"]
+
+
+RIGHT_ARM_TARGET_JOINTS = ["RShoulderPitch",
+                 "RShoulderRoll",
+                 "RElbowYaw",
+                 "RElbowRoll",
+                 "RWristYaw",
+                 "RHand"]
+
+HEAD_TARGET_JOINTS = ["HeadYaw",
+                "HeadPitch"]
+
 
 WORDS_FOR_RECOGNISION = ["START", "STOP"]
 
@@ -92,6 +103,12 @@ def blink_loop():
                 print("BLINK ERROR: {}".format(e))
 
 
+
+
+
+
+
+
 # --- VOICE MONITORING THREAD ---
 def voice_monitor_loop():
     global game_active, current_eye_color
@@ -109,7 +126,7 @@ def voice_monitor_loop():
                 confidence = data[1]
                 
                 # Only act if this is a NEW word we haven't handled yet
-                if confidence > 0.35 and word != last_word_seen:
+                if confidence > 0.40 and word != last_word_seen:
                     last_word_seen = word  # mark it as handled
                     
                     if word == WORDS_FOR_RECOGNISION[0] and not game_active:
@@ -126,7 +143,9 @@ def voice_monitor_loop():
                             restore_eyelashes()
 
                     elif word == WORDS_FOR_RECOGNISION[1] and game_active:
-                        motion.post.setAngles(TARGET_JOINTS, L_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                        motion.post.setAngles(LEFT_ARM_TARGET_JOINTS, L_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                        motion.post.setAngles(RIGHT_ARM_TARGET_JOINTS, R_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                        motion.post.setAngles(HEAD_TARGET_JOINTS, HEAD_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
                         idle_robot()
                         current_eye_color = "red"
                         with led_lock:
@@ -164,8 +183,9 @@ def initialize_robot():
         print("Waking up robot...")
         motion.wakeUp()
 
-        # leds.setIntensity("FaceLeds", 1.0)
-        idle_robot()
+        leds.setIntensity("FaceLeds", 1.0)
+        motion.post.setAngles("HeadPitch", 0.1, FRACTION_MAX_SPEED)
+        # idle_robot()
         
         # --- SETUP SPEECH RECOGNITION ---
         print("Setting up Speech Recognition...")
@@ -267,13 +287,13 @@ def run_udp_server():
 
             command = json.loads(data.decode('utf-8'))
             
-            if command.get("type") == "joints" and "joints" in command:
-                joints = command["joints"]
+            if command.get("type") == "joints" and "LArmJoints" in command:
+                joints = command["LArmJoints"]
                 
                 names = []
                 values = []
                 
-                for j_name in TARGET_JOINTS:
+                for j_name in LEFT_ARM_TARGET_JOINTS:
                     if j_name in joints:
                         names.append(str(j_name))           
                         values.append(float(joints[j_name])) 
@@ -281,13 +301,45 @@ def run_udp_server():
                 if names:
                     motion.post.setAngles(names, values, FRACTION_MAX_SPEED)
 
+
+            if command.get("type") == "joints" and "RArmJoints" in command:
+                joints = command["RArmJoints"]
+                
+                names = []
+                values = []
+                
+                for j_name in RIGHT_ARM_TARGET_JOINTS:
+                    if j_name in joints:
+                        names.append(str(j_name))           
+                        values.append(float(joints[j_name])) 
+                
+                if names:
+                    motion.post.setAngles(names, values, FRACTION_MAX_SPEED)
+
+
+            if command.get("type") == "joints" and "HeadJoints" in command:
+                joints = command["HeadJoints"]
+                
+                names = []
+                values = []
+                
+                for j_name in HEAD_TARGET_JOINTS:
+                    if j_name in joints:
+                        names.append(str(j_name))           
+                        values.append(float(joints[j_name])) 
+                
+                if names:
+                    motion.post.setAngles(names, values, 0.07)
+
         except socket.timeout:
             # --- TIMEOUT LOGIC ---
             # No data received for 0.5 seconds. Check if we should reset.
             if game_active and not is_in_default_position:
                 if time.time() - last_packet_time > 1.5: # 1.5 seconds without commands
                     print("\n[!] Connection lost/paused. Returning to default position.")
-                    motion.post.setAngles(TARGET_JOINTS, L_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                    motion.post.setAngles(LEFT_ARM_TARGET_JOINTS, L_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                    motion.post.setAngles(RIGHT_ARM_TARGET_JOINTS, R_HAND_DEFAULT_ANGLES, FRACTION_MAX_SPEED)
+                    motion.post.setAngles(HEAD_TARGET_JOINTS, HEAD_DEFAULT_ANGLES, 0.07)
                     is_in_default_position = True
 
         except KeyboardInterrupt:

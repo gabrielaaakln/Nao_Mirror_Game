@@ -1,40 +1,118 @@
 import numpy as np
 
-def calculate_head_tracking(pose_landmarks_list):
-    """Calculates how much NAO needs to move its head to center the hips."""
+# ── Head tracking / scanning state ───────────────────────────────────────────
+FOV_H = np.radians(60.9)
+FOV_V = np.radians(47.6)
+
+YAW_MIN,   YAW_MAX   = -2.0857,  2.0857
+PITCH_MIN, PITCH_MAX = -0.6720,  0.5149
+
+_scan_yaw       = 0.0          # current scan position
+_scan_direction = 1            # +1 = sweeping left, -1 = sweeping right
+_scan_step      = 0.04         # radians per call (~2.3° per frame)
+_scan_pitch     = 0.0          # keep head level while scanning
+
+_track_yaw   = 0.0
+_track_pitch = 0.0
+
+
+R_HAND_DEFAULT_ANGLES = {
+    "RShoulderPitch": 1.44,
+    "RShoulderRoll": -0.22,
+    "RElbowYaw": 1.19,
+    "RElbowRoll": 0.40,
+    "RWristYaw": 0.1,
+    "RHand": 0.30
+}
+
+L_HAND_DEFAULT_ANGLES = {
+    "LShoulderPitch": 1.47,
+    "LShoulderRoll": 0.19,
+    "LElbowYaw": -1.18,
+    "LElbowRoll": -0.40,
+    "LWristYaw": 0.09,
+    "LHand": 0.30
+}
+
+def scan_head():
+    """
+    Sweeps HeadYaw left and right until a person is detected.
+    Call this every frame when pose_landmarks is None/empty.
+    Returns (head_yaw, head_pitch).
+    """
+    global _scan_yaw, _scan_direction
+
+    _scan_yaw += _scan_step * _scan_direction
+
+    if _scan_yaw >= YAW_MAX * 0.85:
+        _scan_direction = -1
+    elif _scan_yaw <= YAW_MIN * 0.85:
+        _scan_direction = 1
+
+    return float(_scan_yaw), float(_scan_pitch)
+
+
+def calculate_head_tracking(pose_landmarks, kp_yaw=0.3, kp_pitch=0.3):
+    """
+    Centers the robot's head to frame the person from the waist up.
+    Uses a visibility fallback to prevent snapping if the hips go out of frame.
+    """
+    global _track_yaw, _track_pitch, _scan_yaw, _scan_pitch
+
+    NOSE  = 0
+    L_SHOULDER = 11
+    R_SHOULDER = 12
+    L_HIP = 23
+    R_HIP = 24
+
+    # 1. Horizontal Tracking (X) - Always use shoulders for stability
+    shoulder_cx = (pose_landmarks[L_SHOULDER].x + pose_landmarks[R_SHOULDER].x) / 2.0
+    target_x = shoulder_cx
+
+    # 2. Vertical Tracking (Y) - Frame from Hips to Head
+    nose_y = pose_landmarks[NOSE].y
     
-    # 23 = Left Hip, 24 = Right Hip
-    l_hip = pose_landmarks_list[23]
-    r_hip = pose_landmarks_list[24]
+    # MediaPipe gives a visibility score (0.0 to 1.0) for every landmark.
+    # We check if the hips are actually inside the camera view.
+    hip_visibility = (pose_landmarks[L_HIP].visibility + pose_landmarks[R_HIP].visibility) / 2.0
 
-    # Find the midpoint between the two hips
-    hip_center_x = (l_hip.x + r_hip.x) / 2.0
-    hip_center_y = (l_hip.y + r_hip.y) / 2.0
+    if hip_visibility > 0.5:
+        # Hips are visible! Center the camera halfway between the nose and the hips.
+        hip_cy = (pose_landmarks[L_HIP].y + pose_landmarks[R_HIP].y) / 2.0
+        target_y = (nose_y + hip_cy) / 2.0
+    else:
+        # Hips are out of frame. Estimate where the waist is so the head doesn't snap up.
+        # A human torso is roughly twice the distance from the nose to the shoulders.
+        shoulder_cy = (pose_landmarks[L_SHOULDER].y + pose_landmarks[R_SHOULDER].y) / 2.0
+        nose_to_shoulder_dist = shoulder_cy - nose_y
+        
+        estimated_hip_y = shoulder_cy + (nose_to_shoulder_dist * 2.0)
+        target_y = (nose_y + estimated_hip_y) / 2.0
 
-    # Calculate error from the exact center of the camera (0.5, 0.5)
-    error_x = hip_center_x - 0.5
-    error_y = hip_center_y - 0.5
+    # Calculate error (distance from the center of the screen, which is 0.5)
+    err_x = target_x - 0.5   
+    err_y = target_y - 0.5   
 
-    # --- THE DEADZONE ---
-    # If the hips are close enough to the center, do nothing to prevent jitter!
-    if abs(error_x) < 0.08: error_x = 0
-    if abs(error_y) < 0.08: error_y = 0
+    # DEADZONE: If the person is already roughly centered, don't move the head.
+    # This stops the motors from whining and jittering over 1% errors.
+    DEADZONE = 0.05
+    if abs(err_x) < DEADZONE: err_x = 0
+    if abs(err_y) < DEADZONE: err_y = 0
 
-    # --- THE PROPORTIONAL CONTROLLER (P-Gain) ---
-    # Multiply the error by a factor to get an angle in radians. 
-    # Smaller = smoother but slower. Larger = faster but might oscillate.
-    p_gain_yaw = 0.15   
-    p_gain_pitch = 0.15 
+    # Update the angles based on error
+    _track_yaw   += -kp_yaw * err_x * FOV_H
+    _track_pitch +=  kp_pitch * err_y * FOV_V
 
-    # NAO HeadYaw: Positive is Left, Negative is Right
-    # If error_x is positive (hips are on the right), we need a NEGATIVE yaw offset
-    yaw_offset = -error_x * p_gain_yaw
+    # Clamp to NAO's physical joint limits
+    _track_yaw   = float(np.clip(_track_yaw,   YAW_MIN,   YAW_MAX))
+    _track_pitch = float(np.clip(_track_pitch, PITCH_MIN, PITCH_MAX))
 
-    # NAO HeadPitch: Positive is Down, Negative is Up
-    # If error_y is positive (hips are at the bottom), we need a POSITIVE pitch offset
-    pitch_offset = error_y * p_gain_pitch
+    # Keep the scanner in sync so there's no jump if tracking is lost entirely
+    _scan_yaw   = _track_yaw
+    _scan_pitch = _track_pitch
 
-    return yaw_offset, pitch_offset
+    return _track_yaw, _track_pitch
+
 
 def right_hand_joints(detection_result, right_hand_landmarks):
     NAO_LIMITS = {
@@ -115,36 +193,40 @@ def right_hand_joints(detection_result, right_hand_landmarks):
 
     # 3.5. WRIST YAW - Referință stabilă bazată pe trunchi
 
-    # landmark 5 = INDEX_MCP, landmark 17 = PINKY_MCP (baza degetelor, foarte stabile)
-    index_mcp = np.array([right_hand_landmarks[5].x, right_hand_landmarks[5].y])
-    pinky_mcp = np.array([right_hand_landmarks[17].x, right_hand_landmarks[17].y])
+    if right_hand_landmarks is None:
+        L_Wrist_Yaw = L_HAND_DEFAULT_ANGLES["LWristYaw"]
+        L_Hand = L_HAND_DEFAULT_ANGLES["LHand"]
+    else:
+        # landmark 5 = INDEX_MCP, landmark 17 = PINKY_MCP (baza degetelor, foarte stabile)
+        index_mcp = np.array([right_hand_landmarks[5].x, right_hand_landmarks[5].y])
+        pinky_mcp = np.array([right_hand_landmarks[17].x, right_hand_landmarks[17].y])
 
-    dx = index_mcp[0] - pinky_mcp[0]
-    dy = index_mcp[1] - pinky_mcp[1]
+        dx = index_mcp[0] - pinky_mcp[0]
+        dy = index_mcp[1] - pinky_mcp[1]
 
-    raw_wrist_angle = np.arctan2(dy, dx)
-    L_Wrist_Yaw = raw_wrist_angle + np.pi/2
+        raw_wrist_angle = np.arctan2(dy, dx)
+        L_Wrist_Yaw = raw_wrist_angle + np.pi/2
 
-    # HAND OPEN/CLOSE
-    FINGERTIPS = [8, 12, 16, 20]
-    FINGER_MCP  = [5,  9, 13, 17]
-    wrist = np.array([right_hand_landmarks[0].x,
-                      right_hand_landmarks[0].y,
-                      right_hand_landmarks[0].z])
-    total_score = 0.0
-    for tip_idx, mcp_idx in zip(FINGERTIPS, FINGER_MCP):
-        tip = np.array([right_hand_landmarks[tip_idx].x,
-                        right_hand_landmarks[tip_idx].y,
-                        right_hand_landmarks[tip_idx].z])
-        mcp = np.array([right_hand_landmarks[mcp_idx].x,
-                        right_hand_landmarks[mcp_idx].y,
-                        right_hand_landmarks[mcp_idx].z])
-        dist_tip = np.linalg.norm(tip - wrist)
-        dist_mcp = np.linalg.norm(mcp - wrist)
-        total_score += dist_tip / (dist_mcp + 1e-6)
+        # HAND OPEN/CLOSE
+        FINGERTIPS = [8, 12, 16, 20]
+        FINGER_MCP  = [5,  9, 13, 17]
+        wrist = np.array([right_hand_landmarks[0].x,
+                        right_hand_landmarks[0].y,
+                        right_hand_landmarks[0].z])
+        total_score = 0.0
+        for tip_idx, mcp_idx in zip(FINGERTIPS, FINGER_MCP):
+            tip = np.array([right_hand_landmarks[tip_idx].x,
+                            right_hand_landmarks[tip_idx].y,
+                            right_hand_landmarks[tip_idx].z])
+            mcp = np.array([right_hand_landmarks[mcp_idx].x,
+                            right_hand_landmarks[mcp_idx].y,
+                            right_hand_landmarks[mcp_idx].z])
+            dist_tip = np.linalg.norm(tip - wrist)
+            dist_mcp = np.linalg.norm(mcp - wrist)
+            total_score += dist_tip / (dist_mcp + 1e-6)
 
-    avg_score = total_score / len(FINGERTIPS)
-    L_Hand = float(np.clip((avg_score - 1.0) / 1.5, 0.0, 1.0))
+        avg_score = total_score / len(FINGERTIPS)
+        L_Hand = float(np.clip((avg_score - 1.0) / 1.5, 0.0, 1.0))
 
     # Limităm unghiurile
     L_Elbow_Roll     = np.clip(L_Elbow_Roll,     *NAO_LIMITS["LElbowRoll"])
@@ -153,7 +235,10 @@ def right_hand_joints(detection_result, right_hand_landmarks):
 
     return L_Shoulder_Pitch, L_Shoulder_Roll, L_Elbow_Roll, L_Elbow_Yaw, L_Wrist_Yaw, L_Hand
 
+
+
 def left_hand_joints(detection_result, left_hand_landmarks):
+    # Această funcție controlează BRAȚUL DREPT al lui NAO (pentru a oglindi mâna ta stângă)
     NAO_LIMITS = {
         "RShoulderPitch": [-2.0857, 2.0857],
         "RShoulderRoll":  [-1.3265, 0.3142],
@@ -162,124 +247,123 @@ def left_hand_joints(detection_result, left_hand_landmarks):
         "RWristYaw":      [-1.8238, 1.8238]
     }
 
-    pose_landmarks_list = detection_result.pose_world_landmarks[0]
+    pose = detection_result.pose_world_landmarks[0]
 
-    Lshoulder_Point = np.array([pose_landmarks_list[11].x, pose_landmarks_list[11].y, pose_landmarks_list[11].z])
-    Rshoulder_Point = np.array([pose_landmarks_list[12].x, pose_landmarks_list[12].y, pose_landmarks_list[12].z])
-    Lelbow_Point    = np.array([pose_landmarks_list[13].x, pose_landmarks_list[13].y, pose_landmarks_list[13].z])
-    LWrist_Point    = np.array([pose_landmarks_list[15].x, pose_landmarks_list[15].y, pose_landmarks_list[15].z])
-    Lhip_Point      = np.array([pose_landmarks_list[23].x, pose_landmarks_list[23].y, pose_landmarks_list[23].z])
+    Lshoulder = np.array([pose[11].x, pose[11].y, pose[11].z])
+    Rshoulder = np.array([pose[12].x, pose[12].y, pose[12].z])
+    Lhip      = np.array([pose[23].x, pose[23].y, pose[23].z])
+    Rhip      = np.array([pose[24].x, pose[24].y, pose[24].z])
 
-    # Sistem de referință trunchi
-    # X = lateral (dreapta omului), Y = jos, Z = spre cameră
-    X = Rshoulder_Point - Lshoulder_Point
-    X /= np.linalg.norm(X)
+    Z_torso = (Lshoulder + Rshoulder)/2 - (Lhip + Rhip)/2
+    Z_torso /= np.linalg.norm(Z_torso)
 
-    Y = Lhip_Point - Lshoulder_Point   # în jos
-    Y /= np.linalg.norm(Y)
+    Y_torso = Lshoulder - Rshoulder
+    Y_torso /= np.linalg.norm(Y_torso)
 
-    Z = np.cross(Y, X)                 # spre cameră
-    Z /= np.linalg.norm(Z)
+    X_torso = np.cross(Y_torso, Z_torso)
+    X_torso /= np.linalg.norm(X_torso)
 
-    Varm = Lelbow_Point - Lshoulder_Point
-    Varm /= np.linalg.norm(Varm)
+    Y_torso = np.cross(Z_torso, X_torso)
 
-    Vforearm = LWrist_Point - Lelbow_Point
-    Vforearm /= np.linalg.norm(Vforearm)
+    Lelbow = np.array([pose[13].x, pose[13].y, pose[13].z])
+    Lwrist = np.array([pose[15].x, pose[15].y, pose[15].z])
 
-    # -------------------------------------------------------
-    # SHOULDER PITCH
-    # NAO Pitch = rotație în planul sagital (față/spate + sus/jos)
-    # Când brațul e jos: pitch ~ +1.5, când e sus: pitch ~ -1.5
-    # dot(Varm, Y) > 0 când brațul e în jos (Y e în jos)
-    # dot(Varm, Z) = componenta față/spate
-    R_Shoulder_Pitch = np.arctan2(np.dot(Varm, Y), -np.dot(Varm, Z))
+    Varm_world = Lelbow - Lshoulder
+    Varm_world /= np.linalg.norm(Varm_world)
+    # FIX OGLINDĂ: Am adăugat minus la Y_torso
+    Varm = np.array([np.dot(Varm_world, X_torso), -np.dot(Varm_world, Y_torso), np.dot(Varm_world, Z_torso)])
 
-    # SHOULDER ROLL
-    # NAO Roll drept: negativ = braț depărtat lateral de corp
-    # dot(Varm, X) > 0 când brațul merge spre dreapta omului
-    # Oglindă: stânga om → dreapta NAO, deci Roll negativ când brațul e lateral stânga
-    R_Shoulder_Roll = -np.arctan2(-np.dot(Varm, X),
-                       np.sqrt(np.dot(Varm, Y)**2 + np.dot(Varm, Z)**2))
+    Vforearm_world = Lwrist - Lelbow
+    Vforearm_world /= np.linalg.norm(Vforearm_world)
+    # FIX OGLINDĂ: Am adăugat minus la Y_torso
+    Vforearm = np.array([np.dot(Vforearm_world, X_torso), -np.dot(Vforearm_world, Y_torso), np.dot(Vforearm_world, Z_torso)])
+
+    R_Shoulder_Pitch = np.arctan2(-Varm[2], Varm[0])
+    R_Shoulder_Roll  = np.arcsin(np.clip(Varm[1], -1.0, 1.0))
 
     R_Shoulder_Pitch = np.clip(R_Shoulder_Pitch, *NAO_LIMITS["RShoulderPitch"])
     R_Shoulder_Roll  = np.clip(R_Shoulder_Roll,  *NAO_LIMITS["RShoulderRoll"])
-
-    # ELBOW ROLL - întotdeauna pozitiv pentru dreapta NAO
+    
     R_Elbow_Roll = np.arccos(np.clip(np.dot(Varm, Vforearm), -1.0, 1.0))
-    R_Elbow_Roll = np.clip(R_Elbow_Roll, *NAO_LIMITS["RElbowRoll"])
 
-    # ELBOW YAW - mapare directă fără oglindire pe X
-    # Pentru dreapta, Y_nao = -X_om (oglindă), Z_nao = -Y_om (sus)
-    # Elbow Yaw - identic ca la dreapta, doar variabilele de unghi se schimbă
-    Varm_nao     = np.array([np.dot(Varm, Z), -np.dot(Varm, X), -np.dot(Varm, Y)])
-    Vforearm_nao = np.array([np.dot(Vforearm, Z), -np.dot(Vforearm, X), -np.dot(Vforearm, Y)])
-
-    n_arm = np.cross(Varm_nao, Vforearm_nao)
-    norm_n = np.linalg.norm(n_arm)
-
-    if norm_n > 1e-4:
-        n_arm /= norm_n
-
-        cp, sp = np.cos(R_Shoulder_Pitch), np.sin(R_Shoulder_Pitch)
-        cr, sr = np.cos(R_Shoulder_Roll),  np.sin(R_Shoulder_Roll)
-
-        Y_local = np.array([-cp*sr, cr, sp*sr])
-        Z_local = np.array([sp, 0, cp])
-
-        R_Elbow_Yaw = np.arctan2(np.dot(n_arm, Y_local), -np.dot(n_arm, Z_local))
+    cp, sp = np.cos(R_Shoulder_Pitch), np.sin(R_Shoulder_Pitch)
+    cr, sr = np.cos(R_Shoulder_Roll),  np.sin(R_Shoulder_Roll)
+    Ry_pitch = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz_roll  = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+    R_shoulder = Ry_pitch @ Rz_roll
+    
+    n_arm_nao = np.cross(Varm, Vforearm)
+    n_arm_2 = R_shoulder.T @ n_arm_nao
+    
+    if np.linalg.norm(n_arm_2) > 1e-4:
+        R_Elbow_Yaw = np.arctan2(-n_arm_2[1], n_arm_2[2])
     else:
         R_Elbow_Yaw = 0.0
 
+
+
+    if left_hand_landmarks is None:
+        R_Wrist_Yaw = R_HAND_DEFAULT_ANGLES["RWristYaw"]
+        R_Hand = R_HAND_DEFAULT_ANGLES["RHand"]
+    else:
+        wrist_lm = np.array([left_hand_landmarks[0].x, left_hand_landmarks[0].y, left_hand_landmarks[0].z])
+        index_lm = np.array([left_hand_landmarks[5].x, left_hand_landmarks[5].y, left_hand_landmarks[5].z])
+        pinky_lm = np.array([left_hand_landmarks[17].x, left_hand_landmarks[17].y, left_hand_landmarks[17].z])
+    
+        # FIX PALMĂ: Am inversat pinky_lm cu index_lm pentru a roti palma cu 180 de grade
+        palm_normal_world = np.cross(pinky_lm - wrist_lm, index_lm - wrist_lm)
+        palm_normal_world /= (np.linalg.norm(palm_normal_world) + 1e-6)
+    
+        # FIX OGLINDĂ ȘI LA PALMĂ: Axa Y este inversată
+        palm_normal_nao = np.array([
+            np.dot(palm_normal_world, X_torso), 
+            -np.dot(palm_normal_world, Y_torso), 
+            np.dot(palm_normal_world, Z_torso)
+        ])
+    
+        cy, sy = np.cos(R_Elbow_Yaw), np.sin(R_Elbow_Yaw)
+        Rx_yaw = np.array([[1, 0, 0], [0, cy, -sy], [0, sy, cy]])
+        ce, se = np.cos(R_Elbow_Roll), np.sin(R_Elbow_Roll)
+        Rz_eroll = np.array([[ce, -se, 0], [se, ce, 0], [0, 0, 1]])
+    
+        R_forearm = R_shoulder @ Rx_yaw @ Rz_eroll
+        palm_normal_3 = R_forearm.T @ palm_normal_nao
+        R_Wrist_Yaw = np.arctan2(palm_normal_3[2], palm_normal_3[1])
+
+        FINGERTIPS, FINGER_MCP = [8, 12, 16, 20], [5, 9, 13, 17]
+        total_score = sum(
+            np.linalg.norm(np.array([left_hand_landmarks[t].x, left_hand_landmarks[t].y, left_hand_landmarks[t].z]) - wrist_lm) /
+            (np.linalg.norm(np.array([left_hand_landmarks[m].x, left_hand_landmarks[m].y, left_hand_landmarks[m].z]) - wrist_lm) + 1e-6)
+            for t, m in zip(FINGERTIPS, FINGER_MCP)
+        )
+        R_Hand = float(np.clip(((total_score / len(FINGERTIPS)) - 1.0) / 1.5, 0.0, 1.0))
+
     R_Elbow_Roll     = np.clip(R_Elbow_Roll,     *NAO_LIMITS["RElbowRoll"])
     R_Elbow_Yaw      = np.clip(R_Elbow_Yaw,      *NAO_LIMITS["RElbowYaw"])
-
-
-    # 3.5. WRIST YAW - Referință stabilă bazată pe trunchi
-    # 3.5. WRIST YAW
-    # wrist = np.array([left_hand_landmarks[0].x, left_hand_landmarks[0].z])
-    # middle_mcp = np.array([left_hand_landmarks[9].x, left_hand_landmarks[9].z])
-
-    index_mcp = np.array([left_hand_landmarks[5].x, left_hand_landmarks[5].z])
-    pinky_mcp = np.array([left_hand_landmarks[17].x, left_hand_landmarks[17].z])
-
-    dx = index_mcp[0] - pinky_mcp[0]
-    dz = index_mcp[1] - pinky_mcp[1]
-
-    raw_wrist_angle = np.arctan2(dz, dx)
-
-# Detectează orientarea palmei folosind Z-ul landmark-urilor
-# Dacă palma e spre cameră, index_mcp.z < pinky_mcp.z (în MediaPipe world coords)
-    palm_facing_camera = left_hand_landmarks[5].z < left_hand_landmarks[17].z
-
-# Aplică offset de π dacă palma e spre cameră (față de exterior)
-    if palm_facing_camera:
-        raw_wrist_angle += np.pi
-
-# Inversăm pentru oglindă
-    R_Wrist_Yaw = -(raw_wrist_angle - np.pi / 2)
-
-    R_Wrist_Yaw = np.clip(R_Wrist_Yaw, *NAO_LIMITS["RWristYaw"])
-
-    # HAND OPEN/CLOSE
-    FINGERTIPS = [8, 12, 16, 20]
-    FINGER_MCP  = [5,  9, 13, 17]
-    wrist = np.array([left_hand_landmarks[0].x,
-                      left_hand_landmarks[0].y,
-                      left_hand_landmarks[0].z])
-    total_score = 0.0
-    for tip_idx, mcp_idx in zip(FINGERTIPS, FINGER_MCP):
-        tip = np.array([left_hand_landmarks[tip_idx].x,
-                        left_hand_landmarks[tip_idx].y,
-                        left_hand_landmarks[tip_idx].z])
-        mcp = np.array([left_hand_landmarks[mcp_idx].x,
-                        left_hand_landmarks[mcp_idx].y,
-                        left_hand_landmarks[mcp_idx].z])
-        dist_tip = np.linalg.norm(tip - wrist)
-        dist_mcp = np.linalg.norm(mcp - wrist)
-        total_score += dist_tip / (dist_mcp + 1e-6)
-
-    avg_score = total_score / len(FINGERTIPS)
-    R_Hand = float(np.clip((avg_score - 1.0) / 1.5, 0.0, 1.0))
+    R_Wrist_Yaw      = np.clip(R_Wrist_Yaw,      *NAO_LIMITS["RWristYaw"])
 
     return R_Shoulder_Pitch, R_Shoulder_Roll, R_Elbow_Roll, R_Elbow_Yaw, R_Wrist_Yaw, R_Hand
+
+
+
+
+
+#metrics
+# At module level
+_angle_history = {"L": [], "R": []}
+
+def log_stability(side, joints):
+    _angle_history[side].append(joints)
+    if len(_angle_history[side]) > 100:
+        _angle_history[side].pop(0)
+
+def get_stability_report():
+    report = {}
+    for side, history in _angle_history.items():
+        if len(history) > 10:
+            arr = np.array(history)
+            report[side] = {
+                "std_per_joint": np.std(arr, axis=0).tolist(),
+                "mean_per_joint": np.mean(arr, axis=0).tolist()
+            }
+    return report

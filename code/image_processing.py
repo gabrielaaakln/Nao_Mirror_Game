@@ -15,14 +15,15 @@ import math
 import json
 import os
 import jointsCalculator
+import json, statistics
 
 # Get the absolute path and normalize it
-BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
-HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
-POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
+# BASE_DIR = r"D:\Facultate\VedemCeIese\pi-p-proiect-meowtrix\Models"
+# HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+# POSE_MODEL_PATH = os.path.join(BASE_DIR, "pose_landmarker_full.task")
 
-# HAND_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/hand_landmarker.task'
-# POSE_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/pose_landmarker_heavy.task'
+HAND_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/hand_landmarker.task'
+POSE_MODEL_PATH = '/Users/ziza/University/an3/Sem1/PI-P_utils/nao-docker-bridge/pose_landmarker_heavy.task'
 
 print(f"paths: {HAND_MODEL_PATH}\n {POSE_MODEL_PATH}")
 
@@ -38,11 +39,11 @@ PORT = 5001
 
 NAO_BRIDGE_URL = "http://127.0.0.1:5050/movement"
 
-COMMAND_INTERVAL = 0.1  # comenzi la 20fps
+COMMAND_INTERVAL = 0.05  # comenzi la 20fps
 LAST_COMMAND_TIME = 0
 
 NAO_CMD_IP = "127.0.0.1" # Ensure this points to your command bridge Docker IP
-NAO_CMD_PORT = 9876
+NAO_CMD_PORT = 5050
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Inițializare MediaPipe Pose (SIMPLU)
@@ -52,6 +53,21 @@ pose = mp_pose.Pose(
     min_detection_confidence=1.0,
     min_tracking_confidence=1.0
 )
+
+def send_head_angles(HeadJoints):
+    """Fires a UDP packet to update the head joints."""
+    try:
+        head_yaw, head_pitch = HeadJoints
+        payload = {
+            "type": "joints",
+            "HeadJoints": {
+                "HeadYaw": head_yaw,
+                "HeadPitch": head_pitch
+            }
+        }
+        udp_sock.sendto(json.dumps(payload).encode('utf-8'), (NAO_CMD_IP, NAO_CMD_PORT))
+    except Exception as e:
+        print(f"UDP Error (Head): {e}")
 
 def send_Larm_angles(LHandjoints):
     """Fires a UDP packet to the command bridge instantly."""
@@ -156,16 +172,22 @@ def camera_capture(camera_input):
     hand_landmarker = None
     camera = None
 
+    total_frames = 0
+    pose_detected_frames = 0
+    hand_detected_frames = 0
+    inference_log = [] 
+    latency_log = []   
+
     if camera_input not in ["NAO", "laptop"]:
         raise Exception("Wrong camera_input. Use 'NAO' or 'laptop'")
 
     if camera_input == "NAO":
+        # We just bind the socket. No waiting for accept().
         srv = setup_server(HOST, PORT)
         print("Waiting for NAO to connect...")
-        conn, addr = srv.accept()
+        conn, addr = srv.accept()  # Pass the server socket directly to receive_frame
         # Ensure the accepted connection also disables buffering
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) 
-        print(f"Connected by {addr}")
     
     try:
 
@@ -216,24 +238,37 @@ def camera_capture(camera_input):
         print("Apasă 'q' pentru ieșire\n")
 
         while True:
+            frame_start = time.time()
+
+            
             # Primește frame
             if camera_input == "NAO":
                 frame = receive_frame(conn)
                 if frame is None:
-                    print("Client disconnected.")
                     break
+
             elif camera_input == "laptop":
                 ret, frame = camera.read()
                 if not ret:
                     break
 
+            total_frames += 1
+            
             # Procesare MediaPipe
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
 
             # Detecție
+            t0 = time.time()
             pose_landmarker_result = pose_landmarker.detect(mp_image)
             hand_landmarker_result = hand_landmarker.detect(mp_image)
+            inference_ms = (time.time() - t0) * 1000
+            inference_log.append(inference_ms)
+
+            if pose_landmarker_result.pose_landmarks:
+                pose_detected_frames += 1
+            if hand_landmarker_result.hand_landmarks:
+                hand_detected_frames += 1
 
             # Vizualizare
             annotated_image_rgb = draw_pose_landmarks_on_image(image_rgb, pose_landmarker_result)
@@ -244,40 +279,71 @@ def camera_capture(camera_input):
             if pose_landmarker_result.pose_landmarks:
                 try:
                     # Găsește mâna dreaptă din hand results
-                    right_hand_landmarks = None
-                    right_hand_joints = None
-                    left_hand_landmarks = None
-                    left_hand_joints = None
+                    # Reprezentăm mâinile fizice ale OMULUI
+                    human_right_hand_landmarks = None
+                    human_left_hand_landmarks = None
+                    
+                    # Reprezentăm comenzile finale pentru NAO
+                    nao_left_arm_joints = None
+                    nao_right_arm_joints = None
 
+                    # Găsește mâna dreaptă din hand results
                     for i, handedness in enumerate(hand_landmarker_result.handedness):
                         label = handedness[0].category_name
                         landmarks = hand_landmarker_result.hand_landmarks[i]
                         
-                        if label == "Left": #mediapipe's left is the persons right
-                            right_hand_landmarks = landmarks
-                        elif label == "Right":   #mediapipe's right is the persons left
-                            left_hand_landmarks = landmarks
+                        # Assuming your camera mirror logic is correct:
+                        if label == "Right": 
+                            human_right_hand_landmarks = landmarks
+                            break
+                        elif label == "Left":   
+                            human_left_hand_landmarks = landmarks
+                            break
 
-                    # Calculează joints doar dacă avem și mâna detectată
-                    if right_hand_landmarks is not None:
-                        right_hand_joints = jointsCalculator.left_hand_joints(pose_landmarker_result, right_hand_landmarks)
+                    # MIRRORING LOGIC:
+                    # Omul mișcă mâna DREAPTĂ -> Calculează Pose Dreapta -> Mută brațul STÂNG al lui NAO
+                    nao_left_arm_joints = jointsCalculator.right_hand_joints(pose_landmarker_result, human_right_hand_landmarks)
+                    if nao_left_arm_joints is not None:
+                        jointsCalculator.log_stability("L", nao_left_arm_joints)
 
-                    if left_hand_landmarks is not None:
-                        left_hand_joints = jointsCalculator.right_hand_joints(pose_landmarker_result, left_hand_landmarks)
+                    # Omul mișcă mâna STÂNGĂ -> Calculează Pose Stânga -> Mută brațul DREPT al lui NAO
+                    nao_right_arm_joints = jointsCalculator.left_hand_joints(pose_landmarker_result, human_left_hand_landmarks)
+                    if nao_right_arm_joints is not None:
+                        jointsCalculator.log_stability("R", nao_right_arm_joints)
                     
-                    #head_joints = jointsCalculator.calculate_head_tracking(pose_landmarker_result.pose_landmarks[0]
+                    
+                    # nao_head_joints = jointsCalculator.calculate_head_tracking(pose_landmarker_result.pose_landmarks[0])
+
+
                     timp_acum = time.time()
                     if timp_acum - LAST_COMMAND_TIME > COMMAND_INTERVAL:
-                        if left_hand_joints:
-                            send_Larm_angles(left_hand_joints)
+                        
 
-                        if right_hand_joints:
-                            send_Rarm_angles(right_hand_joints)
+                        dispatch_time = time.time()
+                        pipeline_latency_ms = (dispatch_time - frame_start) * 1000
+                        latency_log.append(pipeline_latency_ms)
+                        # Trimitem datele către brațele corecte ale robotului
+                        if nao_left_arm_joints:
+                            send_Larm_angles(nao_left_arm_joints)
+
+                        if nao_right_arm_joints:
+                            send_Rarm_angles(nao_right_arm_joints)
+
+                        # if nao_head_joints:
+                            # send_head_angles(nao_head_joints)
                         
                         LAST_COMMAND_TIME = timp_acum
                         
                 except Exception as e:
                     print(f"Eroare calcul unghiuri: {e}\n\n")
+                    # nao_head_joints = None
+            else:
+                pass
+                # No person visible — scan until someone appears
+                # nao_head_joints = jointsCalculator.scan_head()
+
+            # if nao_head_joints:
+                    # send_head_angles(nao_head_joints)
 
             # Afișare
             cv2.imshow("NAO Mirror Game", annotated_image_bgr)
@@ -289,6 +355,25 @@ def camera_capture(camera_input):
     except Exception as e:
         print(f"Eroare: {e}")
     finally:
+        if latency_log:
+            report = {
+                "total_frames": total_frames,
+                "pose_detection_rate": pose_detected_frames / total_frames,
+                "hand_detection_rate": hand_detected_frames / total_frames,
+                "latency_ms": {
+                    "mean": statistics.mean(latency_log),
+                    "median": statistics.median(latency_log),
+                    "p95": sorted(latency_log)[int(0.95 * len(latency_log))],
+                    "max": max(latency_log)
+                },
+                "inference_ms": {
+                    "mean": statistics.mean(inference_log)
+                },
+                "joint_stability": jointsCalculator.get_stability_report()
+            }
+            with open("metrics_report.json", "w") as f:
+                json.dump(report, f, indent=2)
+            print("Metrics saved to metrics_report.json")
         if conn:
             conn.close()
         if srv:
@@ -300,6 +385,10 @@ def camera_capture(camera_input):
         if camera:
             camera.release()
         cv2.destroyAllWindows()
+
+
+
+
 
 def setup_server(host, port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -339,7 +428,7 @@ def receive_frame(conn):
 
 def main():
     # Schimbă între "laptop" și "NAO"
-    camera_capture("laptop")
+    camera_capture("NAO")
 
 if __name__ == '__main__':
     main()
