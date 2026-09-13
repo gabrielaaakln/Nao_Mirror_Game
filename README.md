@@ -1,6 +1,6 @@
 # Mirror Game with NAO Robot
 
-**Team:** Meowtrix (Dascalu Ioana-Felicia & Diaconu Gabriel) <br>
+**Team:** Meowtrix (Gabriela Caliniuc & Diaconu Gabriel) <br>
 **Institution:** “Gheorghe Asachi” Technical University of Iasi - Faculty of Automatic Control and Computer Engineering <br>
 **Context:** Project for the Image Processing course, 2025
 
